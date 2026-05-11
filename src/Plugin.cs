@@ -3,6 +3,7 @@ using System.Collections;
 using System.Linq;
 using System.Reflection;
 using BepInEx;
+using BepInEx.Configuration;
 using HarmonyLib;
 using UnityEngine;
 
@@ -13,47 +14,87 @@ public sealed class Plugin : BaseUnityPlugin
 {
     public const string PluginGuid = "gampa.repo.shopkeeperlock";
     public const string PluginName = "Shopkeeper Lock";
-    public const string PluginVersion = "0.1.0";
+    public const string PluginVersion = "0.2.0";
 
     private Harmony? _harmony;
+    private ConfigEntry<float>? _scanIntervalSeconds;
+    private ConfigEntry<bool>? _includeBroadShopFallback;
+    private ConfigEntry<bool>? _logChanges;
 
     private void Awake()
     {
+        _scanIntervalSeconds = Config.Bind(
+            "General",
+            "ScanIntervalSeconds",
+            0.5f,
+            "How often to re-force shopkeeper state. Lower is more aggressive; higher is cheaper.");
+
+        _includeBroadShopFallback = Config.Bind(
+            "General",
+            "IncludeBroadShopFallback",
+            false,
+            "Also scan every MonoBehaviour with 'shop' in its type name. Disabled by default to avoid touching unrelated shop systems.");
+
+        _logChanges = Config.Bind(
+            "General",
+            "LogChanges",
+            true,
+            "Log only when the mod actually changes an object/member state.");
+
         _harmony = new Harmony(PluginGuid);
         _harmony.PatchAll();
 
-        Logger.LogInfo($"{PluginName} {PluginVersion} loaded. Forcing shopkeeper enabled.");
+        Logger.LogInfo($"{PluginName} {PluginVersion} loaded. Forcing ShopKeeper objects enabled.");
         StartCoroutine(ForceShopkeeperLoop());
     }
 
     private IEnumerator ForceShopkeeperLoop()
     {
-        var wait = new WaitForSeconds(1.0f);
-
         while (true)
         {
             try
             {
-                ShopkeeperForcer.ForceAll(Logger.LogInfo, Logger.LogWarning);
+                ShopkeeperForcer.ForceAll(
+                    message =>
+                    {
+                        if (_logChanges?.Value ?? true)
+                            Logger.LogInfo(message);
+                    },
+                    Logger.LogWarning,
+                    _includeBroadShopFallback?.Value ?? false);
             }
             catch (Exception ex)
             {
                 Logger.LogWarning($"Force pass failed: {ex}");
             }
 
-            yield return wait;
+            var interval = Mathf.Max(0.1f, _scanIntervalSeconds?.Value ?? 0.5f);
+            yield return new WaitForSeconds(interval);
         }
     }
 }
 
 internal static class ShopkeeperForcer
 {
-    private static readonly string[] TypeNeedles =
+    // Verified from the inspected Assembly-CSharp.dll:
+    // Assets/Models/Level/Shop/Shop Props/Shopkeeper/ShopKeeper.cs
+    // Assets/Models/Level/Shop/Shop Props/Shopkeeper/shopkeeperDetectionSphere.cs
+    private static readonly string[] ExactTypeNames =
+    {
+        "ShopKeeper",
+        "shopkeeperDetectionSphere"
+    };
+
+    private static readonly string[] TargetTypeNeedles =
     {
         "shopkeeper",
         "shop keeper",
         "shopowner",
-        "shop owner",
+        "shop owner"
+    };
+
+    private static readonly string[] BroadFallbackTypeNeedles =
+    {
         "shop"
     };
 
@@ -75,12 +116,13 @@ internal static class ShopkeeperForcer
         "disable",
         "despawn",
         "hide",
+        "hidden",
         "off"
     };
 
-    public static void ForceAll(Action<string> info, Action<string> warn)
+    public static void ForceAll(Action<string> info, Action<string> warn, bool includeBroadShopFallback)
     {
-        foreach (var behaviour in UnityEngine.Object.FindObjectsOfType<MonoBehaviour>(true))
+        foreach (var behaviour in Resources.FindObjectsOfTypeAll<MonoBehaviour>())
         {
             if (behaviour == null)
                 continue;
@@ -88,23 +130,32 @@ internal static class ShopkeeperForcer
             var type = behaviour.GetType();
             var typeName = type.FullName ?? type.Name;
 
-            if (!LooksShopkeeperRelated(typeName))
+            if (!LooksShopkeeperRelated(type, typeName, includeBroadShopFallback))
                 continue;
 
+            ForceObjectActive(behaviour, typeName, info);
+            ForceBehaviourEnabled(behaviour, typeName, info);
             ForceMembers(behaviour, type, info, warn);
-
-            if (!behaviour.gameObject.activeSelf)
-            {
-                behaviour.gameObject.SetActive(true);
-                info($"Activated GameObject: {GetPath(behaviour.gameObject)} ({typeName})");
-            }
-
-            if (!behaviour.enabled)
-            {
-                behaviour.enabled = true;
-                info($"Enabled Behaviour: {typeName}");
-            }
         }
+    }
+
+    private static void ForceObjectActive(MonoBehaviour behaviour, string typeName, Action<string> info)
+    {
+        var gameObject = behaviour.gameObject;
+        if (gameObject == null || gameObject.activeSelf)
+            return;
+
+        gameObject.SetActive(true);
+        info($"Activated GameObject: {GetPath(gameObject)} ({typeName})");
+    }
+
+    private static void ForceBehaviourEnabled(MonoBehaviour behaviour, string typeName, Action<string> info)
+    {
+        if (behaviour.enabled)
+            return;
+
+        behaviour.enabled = true;
+        info($"Enabled Behaviour: {typeName}");
     }
 
     private static void ForceMembers(object instance, Type type, Action<string> info, Action<string> warn)
@@ -156,10 +207,16 @@ internal static class ShopkeeperForcer
         }
     }
 
-    private static bool LooksShopkeeperRelated(string typeName)
+    private static bool LooksShopkeeperRelated(Type type, string typeName, bool includeBroadShopFallback)
     {
+        if (ExactTypeNames.Any(exact => string.Equals(type.Name, exact, StringComparison.OrdinalIgnoreCase)))
+            return true;
+
         var lower = typeName.ToLowerInvariant();
-        return TypeNeedles.Any(lower.Contains);
+        if (TargetTypeNeedles.Any(lower.Contains))
+            return true;
+
+        return includeBroadShopFallback && BroadFallbackTypeNeedles.Any(lower.Contains);
     }
 
     private static bool LooksRelevantMember(string memberName)
@@ -170,7 +227,7 @@ internal static class ShopkeeperForcer
 
     private static bool ShouldBeTrue(string memberName)
     {
-        // e.g. disabled/despawned/hidden flags should be false; enabled/spawned/active should be true.
+        // e.g. disabled/despawned/hidden/off flags should be false; enabled/spawned/active should be true.
         return !DisableMemberNeedles.Any(memberName.Contains);
     }
 
